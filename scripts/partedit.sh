@@ -133,6 +133,30 @@ while true; do
     else
       size=$(awk -v kb="$size_kb" 'BEGIN { printf "%.2f TB", kb/1024/1024/1024 }')
     fi
+	
+	  # Clean up trailing zeros after the decimal point
+      size=$(awk -v v="$size" 'BEGIN {
+      # Split value and unit
+      split(v, arr, " ")
+      val = arr[1]
+      unit = arr[2]
+
+      # Only process if there is a decimal point
+      if (val ~ /\./) {
+          sub(/\.00$/, "", val)       # remove .00
+          if (val ~ /\./) {
+              sub(/0$/, "", val)      # remove trailing 0 from .x0
+          }
+      }
+
+      # Recombine value and unit
+      if (unit != "") {
+          v = val " " unit
+      } else {
+          v = val
+      }
+      print v
+    }')
 
     table_type_raw=$(sudo parted -sm "$disk_path" print 2>/dev/null | awk -F: 'NR==2 {print $6}')
     case "$table_type_raw" in
@@ -153,7 +177,7 @@ while true; do
   fi
 
   # Step 2: Disk selection
-  DISK_SELECTED=$(dialog --clear --backtitle "Disk Selection" \
+  DISK_SELECTED=$(dialog --clear --backtitle "Partition Editor" \
     --title "Select Target Disk" \
     --menu "Choose the disk to partition:" 15 70 6 "${DISK_MENU[@]}" 3>&1 1>&2 2>&3)
 
@@ -169,6 +193,8 @@ while true; do
 
   # Step 4: Launch cfdisk
   cfdisk "$DISK_SELECTED"
+  
+  dialog --infobox "Refreshing..." 3 18
 
   # Step 5: Refresh partition table
   if command -v partprobe &>/dev/null; then
@@ -176,4 +202,8 @@ while true; do
   else
     sudo blockdev --rereadpt "$DISK_SELECTED"
   fi
+
+  # Wait for udev to settle new partitions
+  sleep 0.1
+  command -v udevadm &>/dev/null && sudo udevadm settle
 done

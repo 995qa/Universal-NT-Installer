@@ -34,6 +34,30 @@ format_size() {
   else
     result=$(awk -v kb="$size_kb" 'BEGIN { val=kb/1024/1024/1024; fmt=sprintf("%.2f TB", val); print fmt }')
   fi
+  
+  # Clean up trailing zeros after the decimal point
+  result=$(awk -v v="$result" 'BEGIN {
+    # Split value and unit
+    split(v, arr, " ")
+    val = arr[1]
+    unit = arr[2]
+
+    # Only process if there is a decimal point
+    if (val ~ /\./) {
+        sub(/\.00$/, "", val)       # remove .00
+        if (val ~ /\./) {
+            sub(/0$/, "", val)      # remove trailing 0 from .x0
+        }
+    }
+
+    # Recombine value and unit
+    if (unit != "") {
+        v = val " " unit
+    } else {
+        v = val
+    }
+    print v
+  }')
 
   echo "$result"
 }
@@ -311,6 +335,7 @@ select_partition() {
         
         if [[ "$part_type_id" == "0x5" || "$part_type_id" == "0xf" || "$part_type_id" == "0x15" || "$part_type_id" == "0x1f" ]]; then
           part_type="EXT"
+		  continue
         fi
 
         # Map partition ID to display filesystem
@@ -363,10 +388,10 @@ select_partition() {
               fs_display="${fstype^^}"
             fi
             ;;
-          5)
+          5|15)
             fs_display="Extended DOS"
             ;;
-          f)
+          f|1f)
             fs_display="Extended LBA"
             ;;
           *)
@@ -383,7 +408,10 @@ select_partition() {
         sudo mkdir -p "$tmp_mount"
         sudo umount "$tmp_mount" 2>/dev/null
 
-        if sudo mount -o ro "$full_path" "$tmp_mount" 2>/dev/null; then
+        if sudo mount -o ro "$full_path" "$tmp_mount" 2>/dev/null \
+          || { [[ "$fstype" == "ntfs" || -z "$fstype" ]] && sudo ntfs-3g -o ro "$full_path" "$tmp_mount" 2>/dev/null; } \
+          || { [[ "$fstype" == "ntfs" || -z "$fstype" ]] && sudo mount -t ntfs3 -o force "$full_path" "$tmp_mount" 2>/dev/null; }
+        then
           df_out=$(df -kP "$tmp_mount" | awk 'NR==2 {print $2, $4}')
           free_kb=$(echo "$df_out" | cut -d' ' -f2)
 		  
@@ -430,7 +458,7 @@ select_partition() {
   
   while true; do
     # Show dialog menu to select partition
-    selected_partition=$(dialog --clear --backtitle "Partition Selection" \
+    selected_partition=$(dialog --clear --backtitle "Partition Formatter" \
       --title "Select Partition" \
       --menu "Choose a partition to format:" 20 80 10 "${PART_MENU[@]}" 3>&1 1>&2 2>&3)
 
@@ -457,7 +485,7 @@ select_partition() {
     id_value=$(echo "$id_value" | tr '[:upper:]' '[:lower:]')
 
     if [[ "$id_value" == "5" || "$id_value" == "f" || "$id_value" == "15" || "$id_value" == "1f" ]]; then
-      dialog --msgbox "Extended partitions cannot be formatted!\nPlease choose a primary or logical partition." 7 60
+      dialog --msgbox "Extended partitions cannot be formatted!\n\nPlease choose a primary or logical partition." 7 60
       continue  # show menu again
     fi
 
@@ -508,68 +536,114 @@ detect_and_format() {
     return 1
   fi
 
-  FS_TYPE=$(dialog --menu "Select filesystem to format partition:" 15 50 6 "${FS_OPTIONS[@]}" 3>&1 1>&2 2>&3) || return 1
-
-  # === Step 2: Access type for FAT16/FAT32 ===
-  if [[ "$FS_TYPE" == "FAT16" || "$FS_TYPE" == "FAT32" ]]; then
-    ACCESS_MODE=$(dialog --menu "Select access mode:" 10 43 2 CHS "CHS (Cylinder/Head/Sector)" LBA "LBA (Logical Block Addressing)" 3>&1 1>&2 2>&3) || return 1
-  fi
-
-  # === Step 3: Label input ===
-  while true; do
-    LABEL=$(dialog --inputbox "Enter volume label (A-Z, a-z, 0-9, space, _ and - allowed):" 10 60 3>&1 1>&2 2>&3) || return 1
-    LABEL="${LABEL#"${LABEL%%[![:space:]]*}"}"
-    LABEL="${LABEL%"${LABEL##*[![:space:]]}"}"
-
-    [[ -z "$LABEL" ]] && break
-
-    if [[ "$FS_TYPE" == "NTFS" ]]; then
-      maxlen=255
-    elif [[ "$FS_TYPE" == "exFAT" ]]; then
-      maxlen=15
-    else  # FAT12/FAT16/FAT32
-      maxlen=11
-    fi
-
-    if [[ ${#LABEL} -gt $maxlen ]]; then
-      dialog --msgbox "Label too long. Max allowed: $maxlen characters." 6 40
-      continue
-    elif echo "$LABEL" | grep -qvE '^[a-zA-Z0-9 _-]+$'; then
-      dialog --msgbox "Invalid characters in label." 6 40
-      continue
-    fi
-    break
-  done
-
-  # === Step 4: Construct format command ===
-  case "$FS_TYPE" in
-    FAT12)
-      format_cmd="mkfs.fat -F 12" ; set_id="1" ; label_flag="-n" ;;
-    FAT16)
-      format_cmd="mkfs.fat -F 16" ; label_flag="-n"
-      [[ "$ACCESS_MODE" == "CHS" ]] && set_id="6"
-      [[ "$ACCESS_MODE" == "LBA" ]] && set_id="e"
-      ;;
-    FAT32)
-      format_cmd="mkfs.fat -F 32" ; label_flag="-n"
-      [[ "$ACCESS_MODE" == "CHS" ]] && set_id="b"
-      [[ "$ACCESS_MODE" == "LBA" ]] && set_id="c"
-      ;;
-    NTFS)
-      format_cmd="mkfs.ntfs -f" ; set_id="7" ; label_flag="-L" ;;
-    exFAT)
-      format_cmd="mkfs.exfat" ; set_id="7" ; label_flag="-L" ;;
-    *)
-      dialog --msgbox "Unsupported filesystem selected." 6 40
-      return 1 ;;
-  esac
-
+  step=1
   
-  # === Step 5: Ask for final confirmation ===
-  if ! confirm_format_dialog "$PARTITION_SELECTED" "$FS_TYPE" "$ACCESS_MODE" "$LABEL"; then
-    return 1
-  fi
+  while true; do
+    case $step in
+      1)  # === Step 1: Select filesystem ===
+          FS_TYPE=$(dialog --menu "Select filesystem to format partition:" 12 50 5 "${FS_OPTIONS[@]}" 3>&1 1>&2 2>&3)
+          case $? in
+            1|255)  # Cancel or ESC
+              step=$((step-1))
+              [[ $step -lt 1 ]] && return 1
+              continue
+              ;;
+          esac
+          step=2
+          ;;
 
+      2)  # === Step 2: Access mode for FAT16/FAT32 ===
+          if [[ "$FS_TYPE" == "FAT16" || "$FS_TYPE" == "FAT32" ]]; then
+            ACCESS_MODE=$(dialog --menu "Select access mode:" 10 43 2 CHS "CHS (Cylinder/Head/Sector)" LBA "LBA (Logical Block Addressing)" 3>&1 1>&2 2>&3)
+            case $? in
+              1|255)
+                step=1
+                continue
+                ;;
+            esac
+			step=3
+          else
+            ACCESS_MODE=""
+			step=3
+          fi
+          ;;
+
+      3)  # === Step 3: Label input ===
+          LABEL=$(dialog --inputbox "Enter volume label (A-Z, a-z, 0-9, space, _ and - allowed):" 9 60 3>&1 1>&2 2>&3) || {
+		    if [[ "$FS_TYPE" == "FAT16" || "$FS_TYPE" == "FAT32" ]]; then
+			  step=2
+			else
+			  step=1
+			fi			
+            continue
+          }
+
+          LABEL="${LABEL#"${LABEL%%[![:space:]]*}"}"
+          LABEL="${LABEL%"${LABEL##*[![:space:]]}"}"
+
+          #  if [[ -z "$LABEL" ]]; then
+          #    dialog --msgbox "Label cannot be empty." 6 40
+          #    continue
+          #  fi
+
+          if [[ -n "$LABEL" ]]; then
+            if [[ "$FS_TYPE" == "NTFS" ]]; then
+              maxlen=255
+            elif [[ "$FS_TYPE" == "exFAT" ]]; then
+              maxlen=15
+            else
+              maxlen=11
+            fi
+
+            if [[ ${#LABEL} -gt $maxlen ]]; then
+              dialog --msgbox "Label too long. Max allowed: $maxlen characters." 6 40
+              continue
+            elif echo "$LABEL" | grep -qvE '^[a-zA-Z0-9 _-]+$'; then
+              dialog --msgbox "Invalid characters in label." 6 40
+              continue
+            fi
+		  fi
+
+          step=4
+          ;;
+
+      4)  # === Step 4: Construct format command ===
+          case "$FS_TYPE" in
+            FAT12)
+              format_cmd="mkfs.fat -F 12" ; set_id="1" ; label_flag="-n" ;;
+            FAT16)
+              format_cmd="mkfs.fat -F 16" ; label_flag="-n"
+              [[ "$ACCESS_MODE" == "CHS" ]] && set_id="6"
+              [[ "$ACCESS_MODE" == "LBA" ]] && set_id="e"
+              ;;
+            FAT32)
+              format_cmd="mkfs.fat -F 32" ; label_flag="-n"
+              [[ "$ACCESS_MODE" == "CHS" ]] && set_id="b"
+              [[ "$ACCESS_MODE" == "LBA" ]] && set_id="c"
+              ;;
+            NTFS)
+              format_cmd="mkfs.ntfs -f" ; set_id="7" ; label_flag="-L" ;;
+            exFAT)
+              format_cmd="mkfs.exfat" ; set_id="7" ; label_flag="-L" ;;
+            *)
+              dialog --msgbox "Unsupported filesystem selected." 6 40
+              step=3
+              continue ;;
+          esac
+
+          step=5
+          ;;
+
+      5)  # === Step 5: Final confirmation ===
+          if ! confirm_format_dialog "$PARTITION_SELECTED" "$FS_TYPE" "$ACCESS_MODE" "$LABEL"; then
+            step=3
+            continue
+          fi
+          break  # Finished successfully
+          ;;
+    esac
+  done
+  
   dialog --infobox "Formatting..." 3 17
 
   # === Step 6: Execute format ===

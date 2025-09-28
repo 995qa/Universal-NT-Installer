@@ -1,10 +1,13 @@
 #!/bin/bash
 
 INSTLR_DEVICE="$1"
-ARCHIVE_FILE="$2"
-OSCODE="$3"
+WIM_FILE="$2"
+WIM_FILE_INDEX="$3"
+OSCODE="$4"
+SETUP_TYPE="$5"
+WIM_IMAGE_INFO="$6"
 
-if [[ -z "$INSTLR_DEVICE" || -z "$ARCHIVE_FILE" || -z "$OSCODE" ]]; then
+if [[ -z "$INSTLR_DEVICE" || -z "$WIM_FILE" || -z "$WIM_FILE_INDEX" || -z "$OSCODE" || -z "$SETUP_TYPE" || -z "$WIM_IMAGE_INFO" ]]; then
   dialog --msgbox "Missing required argument(s)!" 7 50
   exit 1
 fi
@@ -151,6 +154,7 @@ scan_partitions() {
     fi
     if [[ "$id_value" == "5" || "$id_value" == "f" || "$id_value" == "15" || "$id_value" == "1f" ]]; then
       part_type="EXT"
+	  continue
     fi
 
     # Map partition ID to display filesystem
@@ -225,7 +229,10 @@ scan_partitions() {
     sudo umount "$TMP_MOUNT" 2>/dev/null
 
     HAS_OLD_OS_MAP["$full_path"]=0
-    if sudo mount -o ro "$full_path" "$TMP_MOUNT" 2>/dev/null; then
+    if sudo mount -o ro "$full_path" "$TMP_MOUNT" 2>/dev/null \
+      || { [[ "$fstype" == "ntfs" || -z "$fstype" ]] && sudo ntfs-3g -o ro "$full_path" "$TMP_MOUNT" 2>/dev/null; } \
+      || { [[ "$fstype" == "ntfs" || -z "$fstype" ]] && sudo mount -t ntfs3 -o force "$full_path" "$TMP_MOUNT" 2>/dev/null; }
+    then
       # Get total and free space in KB from df
       df_out=$(df -kP "$TMP_MOUNT" | awk 'NR==2 {print $2, $4}')
       free_kb=$(echo "$df_out" | cut -d' ' -f2)
@@ -294,35 +301,62 @@ format_size() {
     result=$(awk -v kb="$size_kb" 'BEGIN { val=kb/1024/1024/1024; fmt=sprintf("%.2f TB", val); print fmt }')
   fi
 
+  # Clean up trailing zeros after the decimal point
+  result=$(awk -v v="$result" 'BEGIN {
+    # Split value and unit
+    split(v, arr, " ")
+    val = arr[1]
+    unit = arr[2]
+
+    # Only process if there is a decimal point
+    if (val ~ /\./) {
+        sub(/\.00$/, "", val)       # remove .00
+        if (val ~ /\./) {
+            sub(/0$/, "", val)      # remove trailing 0 from .x0
+        }
+    }
+
+    # Recombine value and unit
+    if (unit != "") {
+        v = val " " unit
+    } else {
+        v = val
+    }
+    print v
+  }')
+
   echo "$result"
 }
 
 check_partition_compatibility() {
-  local fs_type="$1"
-  local disk="$2"
-  local start_lba="$3"
-  local end_lba="$4"
-  local edition_desc="$5"
+  local part_type="$1"
+  local fs_type="$2"
+  local disk="$3"
+  local start_lba="$4"
+  local end_lba="$5"
+  local edition_desc="$6"
+  
+  # Check for extended partition
+  if [[ "$part_type" == "EXT" ]]; then
+    dialog --msgbox "Installation is not possible on an extended partition!\n\nPlease choose a primary or logical partition." 7 60
+    return 1
+  fi
+  
+  # Check for unformatted partition
+  if [[ "$fs_type" == "Unformatted" ]]; then
+    dialog --msgbox "The selected partition is unformatted.\n\nPlease format it before installing OS." 7 60
+    return 1
+  fi
 
-  local sector_size=$(cat "/sys/block/$(basename "$disk")/queue/logical_block_size")
+  local sector_size=$(cat /sys/block/$(basename "$disk")/queue/logical_block_size 2>/dev/null)
   [[ -z "$sector_size" || "$sector_size" -le 0 ]] && sector_size=512  # Default fallback
 
   local chs_limit_8gb=$(( 7987 * 1024 * 1024 / sector_size ))
   local lba_limit_137gb=$(( 137400000000 / sector_size ))
 
-  # Check for unformatted partition
-  if [[ "$fs_type" == "Unformatted" ]]; then
-    dialog --msgbox "The selected partition is unformatted.\n\nPlease format it before installing OS." 8 60
-    return 1
-  fi
-
   # Windows NT 3.1 / 3.50 / 3.51 Vanilla
   if [[ "$edition_desc" =~ Windows\ NT\ 3\.[15] && "$edition_desc" =~ Vanilla ]]; then
-    if [[ "$fs_type" != "FAT12" && "$fs_type" != "FAT16 CHS" ]]; then
-      dialog --msgbox "Incompatible partition for $edition_desc!\n\nRequirements:\n* FAT12 or FAT16 formatted partition\n* Entire partition must reside within the first 8.3 GB of the disk\n* Must be CHS-accessible" 12 60
-      return 1
-    fi
-    if (( end_lba > chs_limit_8gb )); then
+    if [[ "$fs_type" != "FAT12" && "$fs_type" != "FAT16 CHS" ]] || (( end_lba > chs_limit_8gb )); then
       dialog --msgbox "Incompatible partition for $edition_desc!\n\nRequirements:\n* FAT12 or FAT16 formatted partition\n* Entire partition must reside within the first 8.3 GB of the disk\n* Must be CHS-accessible" 12 60
       return 1
     fi
@@ -330,28 +364,24 @@ check_partition_compatibility() {
 
   # Windows NT 3.51 Patched
   if [[ "$edition_desc" =~ Windows\ NT\ 3\.51 && "$edition_desc" =~ Patched ]]; then
-    if [[ "$fs_type" != "FAT12" && "$fs_type" != "FAT16 CHS" && "$fs_type" != "FAT16 LBA" && "$fs_type" != "FAT32 CHS" && "$fs_type" != "FAT32 LBA"  ]]; then
-      dialog --msgbox "Incompatible partition for $edition_desc!\n\nRequirements:\n* FAT12, FAT16, or FAT32 formatted partition" 10 60
+    if [[ "$fs_type" != "FAT12" && "$fs_type" != "FAT16 CHS" && "$fs_type" != "FAT16 LBA" && "$fs_type" != "FAT32 CHS" && "$fs_type" != "FAT32 LBA" ]]; then
+      dialog --msgbox "Incompatible partition for $edition_desc!\n\nRequirements:\n* FAT12, FAT16, or FAT32 formatted partition" 9 60
       return 1
     fi
   fi
 
   # Windows NT 4.0 Vanilla
   if [[ "$edition_desc" =~ Windows\ NT\ 4\.00 && "$edition_desc" =~ Vanilla ]]; then
-    if [[ "$fs_type" != "FAT12" && "$fs_type" != "FAT16 CHS" && "$fs_type" != "FAT16 LBA" && "$fs_type" != "NTFS" ]]; then
-      dialog --msgbox "Incompatible partition for $edition_desc!\n\nRequirements:\n* FAT12, FAT16, or NTFS formatted partition\n* Entire partition must reside within the first 137.4 GB of the disk" 12 60
-      return 1
-    fi
-    if (( end_lba > lba_limit_137gb )); then
-      dialog --msgbox "Incompatible partition for $edition_desc!\n\nRequirements:\n* FAT12, FAT16, or NTFS formatted partition\n* Entire partition must reside within the first 137.4 GB of the disk" 12 60
+    if [[ "$fs_type" != "FAT12" && "$fs_type" != "FAT16 CHS" && "$fs_type" != "FAT16 LBA" && "$fs_type" != "NTFS" ]] || (( end_lba > lba_limit_137gb )); then
+      dialog --msgbox "Incompatible partition for $edition_desc!\n\nRequirements:\n* FAT12, FAT16, or NTFS formatted partition\n* Entire partition must reside within the first 137.4 GB of the disk" 11 60
       return 1
     fi
   fi
   
-    # Windows NT 4.0 Patched
+  # Windows NT 4.0 Patched
   if [[ "$edition_desc" =~ Windows\ NT\ 4\.00 && "$edition_desc" =~ Patched ]]; then
     if [[ "$fs_type" != "FAT12" && "$fs_type" != "FAT16 CHS" && "$fs_type" != "FAT16 LBA" && "$fs_type" != "FAT32 CHS" && "$fs_type" != "FAT32 LBA" && "$fs_type" != "NTFS" ]]; then
-      dialog --msgbox "Incompatible partition for $edition_desc!\n\nRequirements:\n* FAT12, FAT16, FAT32 or NTFS formatted partition" 10 60
+      dialog --msgbox "Incompatible partition for $edition_desc!\n\nRequirements:\n* FAT12, FAT16, FAT32 or NTFS formatted partition" 9 60
       return 1
     fi
   fi
@@ -359,11 +389,35 @@ check_partition_compatibility() {
   # Windows 2000 or XP (any edition)
   if [[ "$edition_desc" =~ Windows\ 2000 || "$edition_desc" =~ Windows\ XP ]]; then
     if [[ "$fs_type" != "FAT12" && "$fs_type" != "FAT16 CHS" && "$fs_type" != "FAT16 LBA" && "$fs_type" != "FAT32 CHS" && "$fs_type" != "FAT32 LBA" && "$fs_type" != "NTFS" ]]; then
-      dialog --msgbox "Incompatible partition for $edition_desc!\n\nRequirements:\n* FAT12, FAT16, FAT32 or NTFS formatted partition" 10 60
+      dialog --msgbox "Incompatible partition for $edition_desc!\n\nRequirements:\n* FAT12, FAT16, FAT32 or NTFS formatted partition" 9 60
       return 1
     fi
   fi
 
+  return 0
+}
+
+check_partition_compatibility_custom() {
+  local part_type="$1"
+  local fs_type="$2"
+  
+  # Check for extended partition
+  if [[ "$part_type" == "EXT" ]]; then
+    dialog --msgbox "Installation is not possible on an extended partition!\n\nPlease choose a primary or logical partition." 7 60
+    return 1
+  fi
+  
+  # Check for unformatted partition
+  if [[ "$fs_type" == "Unformatted" ]]; then
+    dialog --msgbox "The selected partition is unformatted.\n\nPlease format it before installing OS." 7 60
+    return 1
+  fi
+  
+  if [[ "$fs_type" != "FAT12" && "$fs_type" != "FAT16 CHS" && "$fs_type" != "FAT16 LBA" && "$fs_type" != "FAT32 CHS" && "$fs_type" != "FAT32 LBA" && "$fs_type" != "NTFS" ]]; then
+    dialog --msgbox "Incompatible partition filesystem!\n\nRequirements:\n* FAT12, FAT16, FAT32 or NTFS formatted partition" 9 60
+    return 1
+  fi
+  
   return 0
 }
 
@@ -382,21 +436,53 @@ check_free_space() {
   elif [[ "$edition_desc" =~ Windows\ NT\ 4\.00 && "$edition_desc" =~ Patched ]]; then
     required_kb=$((160 * 1024))
   elif [[ "$edition_desc" =~ Windows\ 2000 && "$edition_desc" =~ Vanilla ]]; then
-    required_kb=$((650 * 1024))
+    required_kb=$((850 * 1024))
   elif [[ "$edition_desc" =~ Windows\ 2000 && "$edition_desc" =~ Patched ]]; then
+    required_kb=$((790 * 1024))
+  elif [[ "$edition_desc" =~ Windows\ XP && "$edition_desc" =~ 86 && "$edition_desc" =~ Vanilla ]]; then
+    required_kb=$((950 * 1024))
+  elif [[ "$edition_desc" =~ Windows\ XP && "$edition_desc" =~ 86 && "$edition_desc" =~ Patched && "$edition_desc" =~ 5.1 ]]; then
     required_kb=$((980 * 1024))
-  elif [[ "$edition_desc" =~ Windows\ XP && "$edition_desc" =~ 86 ]]; then
-    required_kb=$((1500 * 1024))
-  elif [[ "$edition_desc" =~ Windows\ XP && "$edition_desc" =~ 64 ]]; then
-    required_kb=$((2200 * 1024))
+  elif [[ "$edition_desc" =~ Windows\ XP && "$edition_desc" =~ 86 && "$edition_desc" =~ Patched && "$edition_desc" =~ 5.2 ]]; then
+    required_kb=$((860 * 1024))
+  elif [[ "$edition_desc" =~ Windows\ XP && "$edition_desc" =~ 64 && "$edition_desc" =~ Vanilla ]]; then
+    required_kb=$((1350 * 1024))
+  elif [[ "$edition_desc" =~ Windows\ XP && "$edition_desc" =~ 64 && "$edition_desc" =~ Patched ]]; then
+    required_kb=$((1450 * 1024))
   else
-    required_kb=$((2200 * 1024))
+    required_kb=$((1536 * 1024))
   fi
 
   if (( free_kb < required_kb )); then
     local free_fmt=$(format_size "$free_kb")
     local required_fmt=$(format_size "$required_kb")
-    dialog --msgbox "Not enough free space on selected partition!\n\nRequired: $required_fmt\nAvailable: $free_fmt" 9 50
+    dialog --msgbox "Not enough free space on selected partition for $edition_desc!\n\nRequired: $required_fmt\nAvailable: $free_fmt" 10 50
+    return 1
+  fi
+
+  return 0
+}
+
+check_free_space_custom() {
+  local free_kb="$1"
+  
+  local total_bytes=0
+  local custom_WIM_file_path="/mnt/isofiles/osfiles/custom/$WIM_FILE"
+  
+  total_bytes=$(wimlib-imagex info "$custom_WIM_file_path" "$WIM_FILE_INDEX" \
+  | grep -i -m1 'Total Bytes' | sed -E 's/[^0-9]//g' | tr -d '\r')
+
+  if [[ -z "$total_bytes" ]]; then
+    dialog --msgbox "Failed to read WIM file size!\n\nFile: $WIM_FILE\nIndex: $WIM_FILE_INDEX" 9 60
+    return 1
+  fi
+
+  local required_kb=$(( (((total_bytes / 1024 + 10240) + 1023) / 1024) * 1024 ))
+
+  if (( free_kb < required_kb )); then
+    local free_fmt=$(format_size "$free_kb")
+    local required_fmt=$(format_size "$required_kb")
+    dialog --msgbox "Not enough free space on selected partition!\n\nRequired: $required_fmt\nAvailable: $free_fmt" 8 50
     return 1
   fi
 
@@ -541,7 +627,7 @@ controller_OS_check() {
   local edition_desc="$2"
   local irq="$3"
 
-  # NT 3.x Vanilla (except 3.51) only IDE allowed
+  # NT 3.x Vanilla only IDE allowed
   if [[ "$edition_desc" =~ Windows\ NT\ 3\.[01-9] ]] && [[ "$edition_desc" =~ Vanilla ]]; then
     if [[ "$controller" != "IDE" && "$controller" != "SATA (IDE)" ]]; then
       dialog --msgbox "Only IDE disks are supported for $edition_desc!" 7 60
@@ -549,7 +635,7 @@ controller_OS_check() {
     fi
     # IRQ must be 14 for NT 3.1 Vanilla IDE controller
     if [[ "$edition_desc" =~ Windows\ NT\ 3\.1 && "$edition_desc" =~ Vanilla && "$irq" != "14" ]]; then
-      dialog --msgbox "For $edition_desc, SATA or IDE controller IRQ must be 14!\n\nDetected IRQ: $irq" 8 60
+      dialog --msgbox "For $edition_desc, IDE or SATA (IDE) controller IRQ must be 14!\n\nDetected IRQ: $irq" 8 60
       return 1
     fi
   fi
@@ -727,15 +813,17 @@ parse_boot_part_num() {
     # Get the partition type and filesystem type
     parttype=$(lsblk -no PARTTYPE "$partname" 2>/dev/null)
     fstype=$(lsblk -no FSTYPE "$partname" 2>/dev/null)
-
-    if [[ "$parttype" =~ ^0x ]]; then
+	partsize=$(lsblk -nb -no SIZE "$partname" 2>/dev/null)
+	
+	# Check partitions with vaild partition id and size at least 4 MB
+	if [[ "$parttype" =~ ^0x ]] && [[ "$partsize" -ge 4194304 ]]; then
       id="${parttype#0x}"
       id="${id,,}"
       [[ ${#id} -eq 1 ]] && id="0$id"
 
       # If ID is 07 or 17, filesystem must be NTFS
       if [[ "$id" == "07" || "$id" == "17" ]]; then
-        # if [[ "$fstype" != "ntfs" && "$fstype" != "exfat" ]]; then // NTLDR does not recognize exFAT correctly
+        # if [[ "$fstype" != "ntfs" && "$fstype" != "exfat" ]]; then // NTLDR cannot recognize exFAT partitions
         if [[ "$fstype" != "ntfs" ]]; then
           # Invalid filesystem for this ID
           active_partnum=""
@@ -755,7 +843,11 @@ parse_boot_part_num() {
     read -r part fstype parttype <<< "$line"
 
     partnum=$(echo "$part" | grep -o '[0-9]\+$')
-    [[ -z "$partnum" || -z "$fstype" || ! "$parttype" =~ ^0x ]] && continue
+    [[ -z "$partnum" || -z "$fstype" || ! "$parttype" =~ ^0x ]] && continue	
+	
+    # Check partition size (minimum 4 MB)
+    partsize=$(lsblk -nb -no SIZE "$part" 2>/dev/null)
+    [[ "$partsize" -lt 4194304 ]] && continue  # Skip partitions smaller than 4 MB
 
     id="${parttype#0x}"
     id="${id,,}"
@@ -808,8 +900,8 @@ read_os_edition_names() {
     if [[ "$os_code" == "$OSCODE" ]]; then
       IFS=',' read -ra ed_arr <<< "$editions"
       for ed in "${ed_arr[@]}"; do
-        IFS=':' read -r ed_code ed_zip ed_desc <<< "$ed"
-        if [[ "${ed_zip}.tar.gz" == "$ARCHIVE_FILE" ]]; then
+        IFS=':' read -r ed_code ed_index ed_desc <<< "$ed"
+        if [[ "$ed_index" == "$WIM_FILE_INDEX" ]]; then
           EDITION_DESC="$ed_desc"
           break 2
         fi
@@ -825,7 +917,10 @@ read_old_os_folders() {
   fi
 }
 
-read_os_edition_names
+if [[ "$SETUP_TYPE" -eq 0 ]]; then
+  read_os_edition_names
+fi
+
 read_old_os_folders
 
 scan_disks
@@ -839,16 +934,18 @@ while true; do
   
   dialog --infobox "Checking OS disk requirements..." 3 37
   
-  CNTRLR=$(get_disk_interface_type "$DISK_SELECTED")
-  IRQ_NUM=$(get_disk_irq "$DISK_SELECTED")
-  if ! controller_OS_check "$CNTRLR" "$EDITION_DESC" "$IRQ_NUM"; then
-    continue
+  if [[ "$SETUP_TYPE" -eq 0 ]]; then
+    CNTRLR=$(get_disk_interface_type "$DISK_SELECTED")
+    IRQ_NUM=$(get_disk_irq "$DISK_SELECTED")
+    if ! controller_OS_check "$CNTRLR" "$EDITION_DESC" "$IRQ_NUM"; then
+      continue
+    fi
+  
+    if ! check_disk_position "$DISK_SELECTED" "$EDITION_DESC"; then
+      continue
+    fi
   fi
   
-  if ! check_disk_position "$DISK_SELECTED" "$EDITION_DESC"; then
-    continue
-  fi
-
   [[ "${DISK_INFO[$DISK_SELECTED,type]}" != "MBR" ]] && {
     dialog --msgbox "Only MBR disks are supported!\n\nSelected disk type is ${DISK_INFO[$DISK_SELECTED,type]}." 8 50
     continue
@@ -856,13 +953,13 @@ while true; do
   
   BOOT_PART_NUM=$(parse_boot_part_num "$DISK_SELECTED")
   if [[ "$BOOT_PART_NUM" == "-1" ]]; then
-    dialog --msgbox "Setup was unable to find a supported primary partition for booting the NT OS.\n\nPlease create a primary partition formatted with one of the supported file systems:\n* FAT12\n* FAT16\n* FAT32\n* NTFS\n\nThen rerun the setup." 15 60
+    dialog --msgbox "Setup was unable to find a supported primary partition for booting the NT OS.\n\nPlease create a primary partition at least 4 MB formatted with one of the supported file systems:\n* FAT12\n* FAT16\n* FAT32\n* NTFS\n\nThen try again." 15 60
     continue
   fi
   
   if [[ "$parts_scanned" -eq 0 ]]; then  
     scan_partitions $DISK_SELECTED
-    # parts_scanned=1 // makes problem when more than one disk
+    # parts_scanned=1  // makes problem when more than one disk
   fi
 
   while true; do
@@ -929,16 +1026,21 @@ while true; do
     START_LBA=$(echo "$FDISK_LINE" | awk '{print $2}')
     END_LBA=$(echo "$FDISK_LINE" | awk '{print $3}')
 
-    check_partition_compatibility "${PART_FS_MAP[$PART_SELECTED_INDEX]}" "$DISK_SELECTED" "$START_LBA" "$END_LBA" "$EDITION_DESC" || continue
-    check_free_space "${PART_FREE_KB_MAP[$PART_SELECTED_INDEX]}" "$EDITION_DESC" || continue
-
-    # Primary/Logical check for NT 3.1, NT 3.50 and NT 3.51
-    if [[ $is_logical -eq 1 && "$EDITION_DESC" =~ NT\ 3 ]]; then
-      dialog --yesno "$EDITION_DESC might not boot from a logical partition.\n\nProceed at your own risk!\n\nIf it fails to boot, try installing it to a primary partition instead.\n\nDo you want to continue?" 15 70
-      if [[ $? -ne 0 ]]; then
-        continue
+    if [[ "$SETUP_TYPE" -eq 0 ]]; then
+	  check_partition_compatibility "$part_type" "${PART_FS_MAP[$PART_SELECTED_INDEX]}" "$DISK_SELECTED" "$START_LBA" "$END_LBA" "$EDITION_DESC" || continue
+      check_free_space "${PART_FREE_KB_MAP[$PART_SELECTED_INDEX]}" "$EDITION_DESC" || continue
+	
+      # Primary/Logical check for NT 3.1, NT 3.50 and NT 3.51
+      if [[ $is_logical -eq 1 && "$EDITION_DESC" =~ NT\ 3 ]]; then
+        dialog --yesno "$EDITION_DESC might not boot from a logical partition.\n\nProceed at your own risk!\n\nIf it fails to boot, try installing it to a primary partition instead.\n\nDo you want to continue?" 15 70
+        if [[ $? -ne 0 ]]; then
+          continue
+        fi
       fi
-    fi
+	elif [[ "$SETUP_TYPE" -eq 1 ]]; then
+	  check_partition_compatibility_custom "$part_type" "${PART_FS_MAP[$PART_SELECTED_INDEX]}" || continue
+      check_free_space_custom "${PART_FREE_KB_MAP[$PART_SELECTED_INDEX]}" || continue
+	fi
 
     if [[ $hidden_flag == "H" ]]; then
       if ! dialog --yesno "Install partition must be unhidden in order to continue with the installation.\n\nSetup will make the install partition unhidden when it is installing OS.\n\nDo you want to continue?" 15 70; then
@@ -947,22 +1049,22 @@ while true; do
     fi
 
     if [[ "${HAS_OLD_OS_MAP[$OS_PART_NAME]:-0}" -eq 1 ]]; then
-      dialog --yesno "Old Windows OS files detected on the selected partition.\n\nThey will be moved to Windows.old.\n\nContinue?" 10 60
+      dialog --yesno "Old Windows OS files detected on the selected partition.\n\nThey will be moved to Windows.old.\n\nContinue?" 9 60
       if [[ $? -ne 0 ]]; then
         continue
       fi
     fi
 
-    CONFIRM_MSG="OS Edition: $EDITION_DESC\n\n$disk_info_line\n\n$part_info_line1\n$part_info_line2\n\n\nProceed with installation?"
-    dialog --yesno "$CONFIRM_MSG" 14 80 || continue
-    
-    if [[ "$OSCODE" == "XP86P" && "$EDITION_DESC" =~ Patched ]]; then
-      ARCHIVE_FILE="XP86P.tar.gz"
-    elif [[ "$OSCODE" == "XP64P" && "$EDITION_DESC" =~ Patched ]]; then
-      ARCHIVE_FILE="XP64P.tar.gz"
-    fi
+    CONFIRM_MSG=""
+    if [[ "$SETUP_TYPE" -eq 0 ]]; then
+      CONFIRM_MSG="OS Edition: $EDITION_DESC\n\n$disk_info_line\n\n$part_info_line1\n$part_info_line2\n\n\nProceed with installation?"
+    else
+	  CONFIRM_MSG="Custom Installation: $WIM_FILE -> $WIM_IMAGE_INFO\n\n$disk_info_line\n\n$part_info_line1\n$part_info_line2\n\n\nProceed with installation?"
+	fi
+	
+	dialog --yesno "$CONFIRM_MSG" 14 80 || continue
 
-    bash ./scripts/startins.sh "$OS_PART_NAME" "$ARCHIVE_FILE" "$OS_PART_NUM" "$BOOT_PART_NUM" "$OSCODE" "$EDITION_DESC"
+    bash ./scripts/startins.sh "$OS_PART_NAME" "$WIM_FILE" "$WIM_FILE_INDEX" "$OS_PART_NUM" "$BOOT_PART_NUM" "$OSCODE" "$EDITION_DESC" "$SETUP_TYPE" "$WIM_IMAGE_INFO"
     
     STARTINST_EXIT=$?
     

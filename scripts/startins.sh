@@ -349,22 +349,30 @@ fi
 
 # === Apply ACPI Patch ==
 ACPI_SRC=""
+BASE_DIR="/mnt/isofiles/drivers/patched/ACPI"
 
 if [[ "$EDITION_DESC" == *"2000"* && "$EDITION_DESC" == *"Patched"* ]]; then
-  ACPI_SRC="/mnt/isofiles/drivers/patched/ACPI/NT50/acpi.sys"
+  ACPI_SRC=$(find "$BASE_DIR/NT50" -maxdepth 1 -type f -iname "acpi.sys" | head -n1)
 elif [[ "$EDITION_DESC" =~ Windows\ XP && "$EDITION_DESC" =~ 86 && "$EDITION_DESC" == *"NT 5.1 Patched"* ]]; then
-  ACPI_SRC="/mnt/isofiles/drivers/patched/ACPI/NT51/acpi.sys"
+  ACPI_SRC=$(find "$BASE_DIR/NT51" -maxdepth 1 -type f -iname "acpi.sys" | head -n1)
 elif [[ "$EDITION_DESC" =~ Windows\ XP && "$EDITION_DESC" =~ 86 && "$EDITION_DESC" == *"NT 5.2 Patched"* ]]; then
-  ACPI_SRC="/mnt/isofiles/drivers/patched/ACPI/NT52x86/acpi.sys"
+  ACPI_SRC=$(find "$BASE_DIR/NT52x86" -maxdepth 1 -type f -iname "acpi.sys" | head -n1)
 elif [[ "$EDITION_DESC" =~ Windows\ XP && "$EDITION_DESC" =~ 64 && "$EDITION_DESC" == *"Patched"* ]]; then
-  ACPI_SRC="/mnt/isofiles/drivers/patched/ACPI/NT52x64/acpi.sys"
+  ACPI_SRC=$(find "$BASE_DIR/NT52x64" -maxdepth 1 -type f -iname "acpi.sys" | head -n1)
 fi
 
 if [[ -n "$ACPI_SRC" && -f "$ACPI_SRC" ]]; then
-  if [[ -f $MOUNT_POINT/$SYS_DIR/system32/drivers/acpi.sys ]]; then
-    sudo mv $MOUNT_POINT/$SYS_DIR/system32/drivers/acpi.sys $MOUNT_POINT/$SYS_DIR/system32/drivers/acpi.rsc
+  DRIVERS_DIR=$(find "$MOUNT_POINT/$SYS_DIR" -type d -ipath "*/system32/drivers" | head -n1)
+
+  if [[ -n "$DRIVERS_DIR" ]]; then
+    ACPI_FILE=$(find "$DRIVERS_DIR" -maxdepth 1 -type f -iname "acpi.sys" | head -n1)
+
+    if [[ -n "$ACPI_FILE" ]]; then
+      sudo mv "$ACPI_FILE" "$DRIVERS_DIR/acpi.rsc" 2>/dev/null
+    fi
+
+    sudo cp "$ACPI_SRC" "$DRIVERS_DIR/"
   fi
-  sudo cp "$ACPI_SRC" "$MOUNT_POINT/$SYS_DIR/system32/drivers/"
 fi
 
 if [[ "$SETUP_TYPE" -eq 1 ]]; then

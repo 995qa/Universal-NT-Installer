@@ -186,7 +186,7 @@ while true; do
               mapfile -t CUSTOM_WIMS < <(find "$CUSTOM_DIR" -maxdepth 1 -type f \( -iname "*.wim" \) | sort)
 
               if [[ ${#CUSTOM_WIMS[@]} -eq 0 ]]; then
-                dialog --msgbox "No custom WIM files found in $CUSTOM_DIR." 7 60
+                dialog --msgbox "No custom WIM file(s) found in '$CUSTOM_DIR'." 5 66
                 break
               fi
 

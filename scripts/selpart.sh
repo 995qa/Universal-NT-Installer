@@ -46,10 +46,21 @@ scan_disks() {
     # Installer device skipped
     [[ $INSTLR_DEVICE == $disk* ]] && continue
 
-    part_table=$(parted -sm "$disk" print 2>/dev/null | grep "^/dev" | cut -d: -f6 | head -n 1)
-    [[ -z "$part_table" ]] && part_table="Unknown"
-    [[ "$part_table" == "msdos" ]] && part_table="MBR"
-    [[ "$part_table" == "gpt" ]] && part_table="GPT"
+    part_table=$(sudo parted -sm "$disk" print 2>/dev/null | awk -F: 'NR==2 {print $6}')
+    case "$part_table" in
+      msdos) table_type="MBR" ;;
+      gpt)   table_type="GPT" ;;
+      *)
+        # If parted result is not valid, try fdisk as a fallback
+        fdisk_type=$(sudo fdisk -l "$disk" 2>/dev/null | grep "Disklabel type" | awk '{print $3}')
+        case "$fdisk_type" in
+          dos) table_type="MBR" ;;
+          gpt) table_type="GPT" ;;
+          "")  table_type="Unknown" ;;
+          *)   table_type="${fdisk_type^^}" ;;
+        esac
+        ;;
+    esac
 
     disk_basename=$(basename "$disk")
     sector_size=$(cat /sys/block/$disk_basename/queue/hw_sector_size 2>/dev/null || echo 512)
@@ -58,8 +69,8 @@ scan_disks() {
     size_kb=$((size_bytes / 1024))
     size_fmt=$(format_size "$size_kb")
 
-    DISK_MENU+=("$disk" "Size: $size_fmt | Type: $part_table | Cntrlr: $CNTRLR")
-    DISK_INFO["$disk,type"]="$part_table"
+    DISK_MENU+=("$disk" "Size: $size_fmt | Type: $table_type | Cntrlr: $CNTRLR")
+    DISK_INFO["$disk,type"]="$table_type"
     DISK_INFO["$disk,size"]="$size_fmt"
   done
 
@@ -953,7 +964,7 @@ while true; do
   
   BOOT_PART_NUM=$(parse_boot_part_num "$DISK_SELECTED")
   if [[ "$BOOT_PART_NUM" == "-1" ]]; then
-    dialog --msgbox "Setup was unable to find a supported primary partition for booting the NT OS.\n\nPlease create a primary partition at least 4 MB formatted with one of the supported file systems:\n* FAT12\n* FAT16\n* FAT32\n* NTFS\n\nThen try again." 15 60
+    dialog --msgbox "Setup was unable to find a supported primary partition for booting the NT OS.\n\nPlease create a primary partition at least 4 MB formatted with one of the supported file systems:\n\n* FAT12\n* FAT16\n* FAT32\n* NTFS\n\nThen try again." 16 60
     continue
   fi
   

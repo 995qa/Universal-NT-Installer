@@ -191,10 +191,21 @@ select_disk() {
         # Installer device skipped
         [[ $INSTLR_DEVICE == $disk* ]] && continue
 
-        part_table=$(parted -sm "$disk" print 2>/dev/null | grep "^/dev" | cut -d: -f6 | head -n 1)
-        [[ -z "$part_table" ]] && part_table="Unknown"
-        [[ "$part_table" == "msdos" ]] && part_table="MBR"
-        [[ "$part_table" == "gpt" ]] && part_table="GPT"
+        part_table=$(sudo parted -sm "$disk" print 2>/dev/null | awk -F: 'NR==2 {print $6}')
+        case "$part_table" in
+          msdos) table_type="MBR" ;;
+          gpt)   table_type="GPT" ;;
+          *)
+            # If parted result is not valid, try fdisk as a fallback
+            fdisk_type=$(sudo fdisk -l "$disk" 2>/dev/null | grep "Disklabel type" | awk '{print $3}')
+            case "$fdisk_type" in
+              dos) table_type="MBR" ;;
+              gpt) table_type="GPT" ;;
+              "")  table_type="Unknown" ;;
+              *)   table_type="${fdisk_type^^}" ;;
+            esac
+            ;;
+        esac
 
         disk_basename=$(basename "$disk")
         sector_size=$(cat /sys/block/$disk_basename/queue/hw_sector_size 2>/dev/null || echo 512)
@@ -206,8 +217,8 @@ select_disk() {
         # Get controller type
         controller=$(get_disk_interface_type "$disk")
 
-        DISK_MENU+=("$disk" "Size: $size_fmt | Type: $part_table | Cntrlr: $controller")
-        DISK_INFO["$disk,type"]="$part_table"
+        DISK_MENU+=("$disk" "Size: $size_fmt | Type: $table_type | Cntrlr: $controller")
+        DISK_INFO["$disk,type"]="$table_type"
         DISK_INFO["$disk,size"]="$size_fmt"
       done
 

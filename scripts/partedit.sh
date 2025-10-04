@@ -161,9 +161,17 @@ while true; do
     table_type_raw=$(sudo parted -sm "$disk_path" print 2>/dev/null | awk -F: 'NR==2 {print $6}')
     case "$table_type_raw" in
       msdos) table_type="MBR" ;;
-      gpt) table_type="GPT" ;;
-      "") table_type="Unknown" ;;
-      *) table_type="$table_type_raw" ;;
+      gpt)   table_type="GPT" ;;
+      *)
+        # If parted result is not valid, try fdisk as a fallback
+        fdisk_type=$(sudo fdisk -l "$disk_path" 2>/dev/null | grep "Disklabel type" | awk '{print $3}')
+        case "$fdisk_type" in
+          dos) table_type="MBR" ;;
+          gpt) table_type="GPT" ;;
+          "")  table_type="Unknown" ;;
+          *)   table_type="${fdisk_type^^}" ;;
+        esac
+        ;;
     esac
 
     controller=$(get_disk_interface_type "$disk" 2>/dev/null)

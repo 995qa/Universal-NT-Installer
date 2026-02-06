@@ -683,9 +683,9 @@ controller_OS_check() {
     fi
   fi
 
-  # XP (x86/x64) Patched: IDE, AHCI, RAID, eMMC and NVMe
+  # XP (x86/x64) Patched: IDE, AHCI, RAID, eMMC, NVMe, and (maybe) USB
   if [[ "$edition_desc" =~ Windows\ XP ]] && [[ "$edition_desc" =~ Patched ]]; then
-    if [[ "$controller" != "IDE" && "$controller" != "SATA (IDE)" && "$controller" != "AHCI" && "$controller" != "RAID" && "$controller" != "eMMC" && "$controller" != "NVMe" ]]; then
+    if [[ "$controller" != "IDE" && "$controller" != "SATA (IDE)" && "$controller" != "AHCI" && "$controller" != "RAID" && "$controller" != "eMMC" && "$controller" != "NVMe" && "$controller" != "USB" ]]; then
       dialog --msgbox "Only IDE, AHCI, RAID, eMMC and NVMe disks are supported for $edition_desc!" 7 60
       return 1
     fi

@@ -36,7 +36,7 @@ scan_disks() {
 	CNTRLR=$(get_disk_interface_type "$disk")
 	
 	case "$CNTRLR" in
-      "IDE"|"SATA (IDE)"|"AHCI"|"RAID"|"eMMC"|"NVMe"|"SCSI")
+      "IDE"|"SATA (IDE)"|"AHCI"|"RAID"|"eMMC"|"NVMe"|"SCSI"|"USB"|"USB 1.x"|"USB 2.0"|"USB 3.x")
         ;;  # accepted types -> do nothing
       *)
         continue  # skip unsupported types
